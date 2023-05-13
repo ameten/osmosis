@@ -31,10 +31,12 @@ struct Header {
     proposer_address: String,
 }
 
+const OSMOSIS_LOWEST_HEIGHT: u128 = 9558628;
+
 #[tokio::main]
 async fn main() -> core::result::Result<(), Error> {
     let request_url = format!("https://rpc.osmosis.zone/block?height={height}",
-                              height = "9558629");
+                              height = OSMOSIS_LOWEST_HEIGHT);
     println!("{}", request_url);
     let raw_response = reqwest::get(&request_url).await?;
 
