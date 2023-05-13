@@ -1,2 +1,2 @@
 [workspace]
-members = ["indexer"]
+members = ["indexer", "statistics"]
