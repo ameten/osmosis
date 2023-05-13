@@ -1,4 +1,4 @@
-version: '3.8'
+version: "3.8"
 services:
   db:
     image: postgres:15.3
@@ -7,10 +7,15 @@ services:
       - POSTGRES_USER=osmosis
       - POSTGRES_PASSWORD=osmosis
     ports:
-      - '5432:5432'
+      - "5432:5432"
     volumes:
       - db:/var/lib/postgresql/data
       - ./database/00_init.sql:/docker-entrypoint-initdb.d/create_tables.sql
+  indexer:
+    image: indexer:latest
+    depends_on:
+      - db
+
 volumes:
   db:
     driver: local

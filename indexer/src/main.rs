@@ -70,7 +70,7 @@ async fn main() -> Result<(), Error> {
         .map_err(|_| Error::CouldNotCreateHttpClient)?;
 
     let (database_client, database_connection) =
-        tokio_postgres::connect("host=localhost port=5432 user=osmosis password=osmosis", tokio_postgres::NoTls)
+        tokio_postgres::connect("host=db port=5432 user=osmosis password=osmosis", tokio_postgres::NoTls)
             .await.map_err(|_| Error::CouldNotCreateDatabaseClient)?;
 
     tokio::spawn(async move {
