@@ -10,7 +10,7 @@ services:
       - "5432:5432"
     volumes:
       - db:/var/lib/postgresql/data
-      - ./database/00_init.sql:/docker-entrypoint-initdb.d/create_tables.sql
+      - ./database/00_init.sql:/docker-entrypoint-initdb.d/00_init.sql
   indexer:
     image: indexer:latest
     depends_on:

@@ -1,3 +1,4 @@
+use std::thread;
 use std::time::Duration;
 use reqwest::Client;
 
@@ -69,15 +70,7 @@ async fn main() -> Result<(), Error> {
         .build()
         .map_err(|_| Error::CouldNotCreateHttpClient)?;
 
-    let (database_client, database_connection) =
-        tokio_postgres::connect("host=db port=5432 user=osmosis password=osmosis", tokio_postgres::NoTls)
-            .await.map_err(|_| Error::CouldNotCreateDatabaseClient)?;
-
-    tokio::spawn(async move {
-        if let Err(e) = database_connection.await {
-            println!("connection error: {e}");
-        }
-    });
+    let database_client = connect_to_database().await?;
 
     let forever = task::spawn(async move {
         let mut interval = time::interval(Duration::from_secs(INDEXER_INTERVAL_IN_SECONDS));
@@ -94,6 +87,31 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
+/// When we start database and indexer in docker compose, database is not ready and indexer
+/// cannot connect to it. We shall do several attempts to connect to database before failing.
+async fn connect_to_database() -> Result<tokio_postgres::Client, Error> {
+    for _ in 0..10 {
+        thread::sleep(Duration::from_secs(2));
+        if let Ok(c) = connect_to_database_unsafe().await { return Ok(c) }
+    }
+
+    Err(Error::CouldNotCreateDatabaseClient)
+}
+
+async fn connect_to_database_unsafe() -> Result<tokio_postgres::Client, Error> {
+    let (database_client, database_connection) =
+        tokio_postgres::connect("host=db port=5432 user=osmosis password=osmosis", tokio_postgres::NoTls)
+            .await.map_err(|_| Error::CouldNotCreateDatabaseClient)?;
+
+    tokio::spawn(async move {
+        if let Err(e) = database_connection.await {
+            println!("connection error: {e}");
+        }
+    });
+
+    Ok(database_client)
+}
+
 async fn index(http_client: &Client, database_client: &tokio_postgres::Client)
                -> Result<(), Error> {
     let height_to_index: i64 = database_client
@@ -101,7 +119,9 @@ async fn index(http_client: &Client, database_client: &tokio_postgres::Client)
         .await
         .map_err(|_| Error::CouldNotFindIndexedHeight)?
         .get(0)
-        .map_or_else(|| OSMOSIS_LOWEST_HEIGHT - 1, |r| r.get(0)) + 1;
+        .map_or_else(|| OSMOSIS_LOWEST_HEIGHT - 1, |r| {
+            r.try_get(0).map_or_else(|_| OSMOSIS_LOWEST_HEIGHT - 1, |v| v)
+        }) + 1;
 
     println!("height_to_index: {height_to_index}");
 
