@@ -1,4 +1,5 @@
 use std::time::Duration;
+use reqwest::Client;
 
 use serde::Deserialize;
 use serde_aux::prelude::*;
@@ -6,12 +7,12 @@ use tokio::{task, time};
 use tokio::task::JoinSet;
 
 #[derive(Deserialize, Debug)]
-struct Response {
-    result: Result,
+struct BlockResponse {
+    result: BlockResult,
 }
 
 #[derive(Deserialize, Debug)]
-struct Result {
+struct BlockResult {
     block: Block,
 }
 
@@ -27,13 +28,24 @@ struct Header {
     proposer_address: String,
 }
 
+#[derive(Deserialize, Debug)]
+struct BlockchainResponse {
+    result: BlockchainResult,
+}
+
+#[derive(Deserialize, Debug)]
+struct BlockchainResult {
+    #[serde(deserialize_with = "deserialize_number_from_string")]
+    last_height: i64,
+}
+
 struct ProposerToHeight {
     proposer: String,
     height: i64,
 }
 
 const OSMOSIS_LOWEST_HEIGHT: i64 = 9558628;
-const INDEXER_INTERVAL: u64 = 5;
+const INDEXER_INTERVAL_IN_SECONDS: u64 = 30;
 const MAXIMUM_NUMBER_OF_PARALLEL_REQUESTS: i64 = 5;
 
 #[derive(Debug)]
@@ -42,6 +54,7 @@ enum Error {
     CouldNotBuildHttpRequest,
     CouldNotGetResponseFromServer,
     CouldNotParseResponseForBlockAtHeight,
+    CouldNotParseResponseForBlockchain,
     CouldNotProcessResponsesInParallel,
 
     CouldNotCreateDatabaseClient,
@@ -51,8 +64,8 @@ enum Error {
 }
 
 #[tokio::main]
-async fn main() -> core::result::Result<(), Error> {
-    let http_client = reqwest::Client::builder()
+async fn main() -> Result<(), Error> {
+    let http_client = Client::builder()
         .build()
         .map_err(|_| Error::CouldNotCreateHttpClient)?;
 
@@ -67,7 +80,7 @@ async fn main() -> core::result::Result<(), Error> {
     });
 
     let forever = task::spawn(async move {
-        let mut interval = time::interval(Duration::from_secs(INDEXER_INTERVAL));
+        let mut interval = time::interval(Duration::from_secs(INDEXER_INTERVAL_IN_SECONDS));
 
         loop {
             interval.tick().await;
@@ -81,8 +94,8 @@ async fn main() -> core::result::Result<(), Error> {
     Ok(())
 }
 
-async fn index(http_client: &reqwest::Client, database_client: &tokio_postgres::Client)
-               -> core::result::Result<(), Error> {
+async fn index(http_client: &Client, database_client: &tokio_postgres::Client)
+               -> Result<(), Error> {
     let height_to_index: i64 = database_client
         .query("SELECT max(height) FROM proposer_to_height", &[])
         .await
@@ -92,24 +105,52 @@ async fn index(http_client: &reqwest::Client, database_client: &tokio_postgres::
 
     println!("height_to_index: {height_to_index}");
 
-    let proposers_to_height =
-        request_proposers(http_client, height_to_index).await?;
+    let last_height = request_last_height(http_client).await?;
+    println!("last_height: {last_height}");
 
-    let query = prepare_statement(&proposers_to_height);
-    println!("query: {}", query);
+    if height_to_index > last_height {
+        println!("Nothing to index");
+        return Ok(());
+    }
 
-    let count_rows_inserted = database_client
-        .execute(&query, &[])
-        .await
-        .map_err(|_| Error::CouldNotIndexDuplicateHeight)? as usize;
+    let mut first_height_to_index = height_to_index;
 
-    println!("{:?}", count_rows_inserted);
+    while first_height_to_index < last_height {
+        let last_height_to_index = if first_height_to_index + MAXIMUM_NUMBER_OF_PARALLEL_REQUESTS > last_height {
+            last_height
+        } else {
+            first_height_to_index + MAXIMUM_NUMBER_OF_PARALLEL_REQUESTS
+        };
 
-    if count_rows_inserted != proposers_to_height.len() {
-        return Err(Error::InsertedIncorrectNumberOfRows);
+        let proposers_to_height =
+            request_proposers(http_client, first_height_to_index, last_height_to_index).await?;
+
+        let query = prepare_statement(&proposers_to_height);
+        println!("query: {}", query);
+
+        let count_rows_inserted = database_client
+            .execute(&query, &[])
+            .await
+            .map_err(|_| Error::CouldNotIndexDuplicateHeight)? as usize;
+
+        if count_rows_inserted != proposers_to_height.len() {
+            return Err(Error::InsertedIncorrectNumberOfRows);
+        }
+
+        first_height_to_index = last_height_to_index;
     }
 
     Ok(())
+}
+
+async fn request_last_height(http_client: &Client) -> Result<i64, Error> {
+    let raw_response =
+        request(http_client.clone(), "https://rpc.osmosis.zone/blockchain".to_string())
+            .await?;
+    let response: BlockchainResponse = raw_response.json()
+        .await
+        .map_err(|_| Error::CouldNotParseResponseForBlockchain)?;
+    Ok(response.result.last_height)
 }
 
 fn prepare_statement(proposers_to_height: &Vec<ProposerToHeight>) -> String {
@@ -129,12 +170,14 @@ fn prepare_statement(proposers_to_height: &Vec<ProposerToHeight>) -> String {
 /// https://rpc.osmosis.zone/blockchain?minHeight=9558628 gives only 20 heights back from the top
 /// Requests are made in parallel and the number of such requests is limited to avoid overloading
 /// the server.
-async fn request_proposers(http_client: &reqwest::Client, height_to_index: i64)
-                           -> core::result::Result<Vec<ProposerToHeight>, Error> {
+async fn request_proposers(http_client: &Client,
+                           first_height_to_index: i64,
+                           last_height_to_index: i64)
+                           -> Result<Vec<ProposerToHeight>, Error> {
     let mut set = JoinSet::new();
 
-    for i in 0..MAXIMUM_NUMBER_OF_PARALLEL_REQUESTS {
-        let request_url = format!("https://rpc.osmosis.zone/block?height={}", height_to_index + i);
+    for height in first_height_to_index..last_height_to_index {
+        let request_url = format!("https://rpc.osmosis.zone/block?height={height}");
         println!("request_url: {}", request_url);
 
         let future_response = request(http_client.clone(), request_url);
@@ -147,7 +190,7 @@ async fn request_proposers(http_client: &reqwest::Client, height_to_index: i64)
         let raw_response = res
             .map_err(|_| Error::CouldNotProcessResponsesInParallel)??;
 
-        let response: Response = raw_response.json()
+        let response: BlockResponse = raw_response.json()
             .await
             .map_err(|_| Error::CouldNotParseResponseForBlockAtHeight)?;
         println!("{:?}", response);
@@ -163,9 +206,8 @@ async fn request_proposers(http_client: &reqwest::Client, height_to_index: i64)
     Ok(proposers_to_height)
 }
 
-async fn request(http_client: reqwest::Client, request_url: String)
-                 -> core::result::Result<reqwest::Response, Error> {
-
+async fn request(http_client: Client, request_url: String)
+                 -> Result<reqwest::Response, Error> {
     let request = http_client.get(request_url).build()
         .map_err(|_| Error::CouldNotBuildHttpRequest)?;
 
